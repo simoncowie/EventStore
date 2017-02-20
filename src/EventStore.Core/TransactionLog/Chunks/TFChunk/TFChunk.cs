@@ -171,7 +171,7 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
             try
             {
                 _chunkHeader = ReadHeader(reader.Stream);
-                if (_chunkHeader.Version != CurrentChunkVersion)
+                if (_chunkHeader.Version != CurrentChunkVersion && _chunkHeader.Version != 3)
                     throw new CorruptDatabaseException(new WrongFileVersionException(_filename, _chunkHeader.Version, CurrentChunkVersion));
 
                 _chunkFooter = ReadFooter(reader.Stream);
@@ -242,7 +242,7 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
 
             SetAttributes();
             CreateWriterWorkItemForExistingChunk(writePosition, out _chunkHeader);
-            if (_chunkHeader.Version != CurrentChunkVersion)
+            if (_chunkHeader.Version != CurrentChunkVersion && _chunkHeader.Version != 3)
                 throw new CorruptDatabaseException(new WrongFileVersionException(_filename, _chunkHeader.Version, CurrentChunkVersion));
             CreateReaderStreams();
 
@@ -609,7 +609,7 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
             return _readSide.TryReadClosestBackward(logicalPosition);
         }
 
-        public RecordWriteResult TryAppend(LogRecord record)
+        public RecordWriteResult TryAppend(LogRecord record, bool isUpgrade = false)
         {
             if (_isReadOnly) 
                 throw new InvalidOperationException("Cannot write to a read-only block.");
@@ -635,8 +635,10 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
             
             // for non-scavenged chunk _physicalDataSize should be the same as _logicalDataSize
             // for scavenged chunk _logicalDataSize should be at least the same as _physicalDataSize
+            // unless the chunk is being upgraded during the scavenge, in which case the record may increase in size
             if ((!ChunkHeader.IsScavenged && _logicalDataSize != _physicalDataSize)
-                || (ChunkHeader.IsScavenged && _logicalDataSize < _physicalDataSize))
+                || (ChunkHeader.IsScavenged && _logicalDataSize < _physicalDataSize && !isUpgrade)
+                )
             {
                 throw new Exception(string.Format("Data sizes violation. Chunk: {0}, IsScavenged: {1}, LogicalDataSize: {2}, PhysicalDataSize: {3}.",
                                                   FileName, ChunkHeader.IsScavenged, _logicalDataSize, _physicalDataSize));
@@ -685,20 +687,20 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
             CompleteNonRaw(null);
         }
 
-        public void CompleteScavenge(ICollection<PosMap> mapping)
+        public void CompleteScavenge(ICollection<PosMap> mapping, bool isUpgrade)
         {
             if (!ChunkHeader.IsScavenged)
                 throw new InvalidOperationException("CompleteScavenged should not be used for non-scavenged chunks.");
 
-            CompleteNonRaw(mapping);
+            CompleteNonRaw(mapping, isUpgrade);
         }
 
-        private void CompleteNonRaw(ICollection<PosMap> mapping)
+        private void CompleteNonRaw(ICollection<PosMap> mapping, bool isUpgrade = false)
         {
             if (_isReadOnly)
                 throw new InvalidOperationException("Cannot complete a read-only TFChunk.");
 
-            _chunkFooter = WriteFooter(mapping);
+            _chunkFooter = WriteFooter(mapping, isUpgrade);
             Flush();
             _isReadOnly = true;
 
@@ -722,7 +724,7 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
             SetAttributes();
         }
 
-        private ChunkFooter WriteFooter(ICollection<PosMap> mapping)
+        private ChunkFooter WriteFooter(ICollection<PosMap> mapping, bool isUpgrade = false)
         {
             var workItem = _writerWorkItem;
 
@@ -735,7 +737,7 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
                                                       + "You probably are writing scavenged chunk as cached. "
                                                       + "Do not do this.");
                 }
-                mapSize = mapping.Count * PosMap.FullSize;
+                mapSize = mapping.Count * PosMap.V2Size;
                 workItem.Buffer.SetLength(mapSize);
                 workItem.Buffer.Position = 0;
                 foreach (var map in mapping)
@@ -748,11 +750,12 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk
                 WriteRawData(workItem, workItem.Buffer);
             }
 
-            var footerNoHash = new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize, new byte[ChunkFooter.ChecksumSize]);
+            
+            var footerNoHash = new ChunkFooter(true, isUpgrade, PosMap.CurrentPosMapVersion, _physicalDataSize, LogicalDataSize, mapSize, new byte[ChunkFooter.ChecksumSize]);
             //MD5
             workItem.MD5.TransformFinalBlock(footerNoHash.AsByteArray(), 0, ChunkFooter.Size - ChunkFooter.ChecksumSize);
             //FILE
-            var footerWithHash = new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize, workItem.MD5.Hash);
+            var footerWithHash = new ChunkFooter(true, isUpgrade, PosMap.CurrentPosMapVersion, _physicalDataSize, LogicalDataSize, mapSize, workItem.MD5.Hash);
             workItem.AppendData(footerWithHash.AsByteArray(), 0, ChunkFooter.Size);
 
             Flush(); // trying to prevent bug with resized file, but no data in it
